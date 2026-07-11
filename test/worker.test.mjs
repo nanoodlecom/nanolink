@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { gzipSync } from "node:zlib";
 import worker from "../src/worker.mjs";
-import { slugFor, MAX_URL_LENGTH } from "../src/lib.mjs";
+import { slugFor, MAX_URL_LENGTH, CARD_DESC, GENERIC_TITLE } from "../src/lib.mjs";
 
 // Minimal in-memory stand-in for a Workers KV namespace (the two methods the
 // worker uses). Counts puts so dedupe behavior is observable.
@@ -46,7 +47,13 @@ test("POST /api/links stores and returns slug + shortUrl", async () => {
   const body = await res.json();
   assert.equal(body.slug, await slugFor(GOOD_URL));
   assert.equal(body.shortUrl, `${BASE}/${body.slug}`);
-  assert.equal(LINKS.store.get(body.slug), GOOD_URL);
+  // v2 KV shape: a JSON record. GOOD_URL's #a= fragment is not decodable
+  // (it's just Zs), so the metadata is null — and the POST still succeeded.
+  assert.deepEqual(JSON.parse(LINKS.store.get(body.slug)), {
+    url: GOOD_URL,
+    title: null,
+    desc: null,
+  });
 });
 
 test("POST is deterministic and never stores twice", async () => {
@@ -162,4 +169,117 @@ test("peek 404s on unknown or malformed slugs", async () => {
 test("peek rejects non-GET", async () => {
   const res = await call({ LINKS: kvStub() }, "/api/links/AAAAAAAA", { method: "DELETE" });
   assert.equal(res.status, 405);
+});
+
+// --- v2: link-preview cards -----------------------------------------------------
+
+const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
+
+const GRAPH = {
+  v: 1,
+  nodes: [
+    { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+    { id: "n2", type: "llm", x: 1, y: 0, fields: {} },
+    { id: "n3", type: "image", x: 2, y: 0, fields: {} },
+  ],
+  links: [
+    { id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } },
+    { id: "l2", from: { node: "n2", port: "text" }, to: { node: "n3", port: "prompt" } },
+  ],
+  nid: 4, lid: 3, view: { panX: 0, panY: 0, scale: 1 },
+};
+
+const GRAPH_URL = "https://nanoodle.com/#g=" + b64url(gzipSync(JSON.stringify(GRAPH)));
+
+test("store + bounce a #g= link: derived chain title in the OG card", async () => {
+  const LINKS = kvStub();
+  const { slug } = await (await postLink({ LINKS }, { url: GRAPH_URL })).json();
+
+  // Stored record carries the metadata derived at store time.
+  const rec = JSON.parse(LINKS.store.get(slug));
+  assert.equal(rec.url, GRAPH_URL);
+  assert.equal(rec.title, "text → llm → image");
+  assert.equal(rec.desc, CARD_DESC);
+
+  const res = await call({ LINKS }, `/${slug}`);
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.ok(page.includes('<meta property="og:title" content="text → llm → image">'), "og:title");
+  assert.ok(page.includes(`<meta property="og:description" content="${CARD_DESC}">`), "og:description");
+  assert.ok(page.includes('<meta property="og:site_name" content="nanoodle">'), "og:site_name");
+  assert.ok(page.includes('<meta property="og:type" content="website">'), "og:type");
+  assert.ok(page.includes(`<meta property="og:url" content="${BASE}/${slug}">`), "og:url = short link");
+  assert.ok(page.includes('<meta property="og:image" content="https://nanoodle.com/og-card.png">'), "og:image");
+  assert.ok(page.includes('<meta name="twitter:card" content="summary_large_image">'), "twitter:card");
+  // v1 bounce mechanics untouched.
+  assert.match(page, /http-equiv="refresh"/);
+  assert.match(page, /location\.replace\(/);
+});
+
+test("store + bounce an #a=u app link: app name becomes the card title", async () => {
+  const LINKS = kvStub();
+  const app = { v: 1, graph: GRAPH, name: "Poster maker" };
+  const url = "https://nanoodle.com/play#a=u" + b64url(JSON.stringify(app));
+  const { slug } = await (await postLink({ LINKS }, { url })).json();
+  assert.equal(JSON.parse(LINKS.store.get(slug)).title, "Poster maker");
+  const page = await (await call({ LINKS }, `/${slug}`)).text();
+  assert.ok(page.includes('<meta property="og:title" content="Poster maker">'));
+});
+
+test("LEGACY plain-string KV value still bounces, with the generic card", async () => {
+  const LINKS = kvStub();
+  const slug = await slugFor(GOOD_URL);
+  LINKS.store.set(slug, GOOD_URL); // exactly what v1 stored
+  const res = await call({ LINKS }, `/${slug}`);
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.ok(page.includes(GOOD_URL), "still bounces to the stored url");
+  assert.ok(page.includes(`<meta property="og:title" content="${GENERIC_TITLE}">`), "generic title");
+  assert.ok(page.includes(`<meta property="og:description" content="${CARD_DESC}">`), "brand desc");
+  // Peek also reads the legacy shape.
+  const peek = await call({ LINKS }, `/api/links/${slug}`);
+  assert.deepEqual(await peek.json(), { url: GOOD_URL });
+});
+
+test("malformed fragment: POST still 200, bounce serves the generic card", async () => {
+  const LINKS = kvStub();
+  for (const frag of [
+    "#g=!!!not-base64url!!!",
+    "#g=" + b64url("not gzip at all"),
+    "#a=" + b64url(gzipSync("this is not json")),
+    "#j=" + b64url("{truncated"),
+    "#a=u" + b64url("[1,2,3]"), // valid JSON, wrong shape
+    "#unrelated=stuff",
+    "", // no fragment at all
+  ]) {
+    const url = "https://nanoodle.com/play" + frag;
+    const res = await postLink({ LINKS }, { url });
+    assert.equal(res.status, 200, frag);
+    const { slug } = await res.json();
+    const rec = JSON.parse(LINKS.store.get(slug));
+    assert.equal(rec.title, null, frag);
+    const page = await (await call({ LINKS }, `/${slug}`)).text();
+    assert.ok(page.includes(`<meta property="og:title" content="${GENERIC_TITLE}">`), frag);
+  }
+});
+
+test("XSS attempt in app name / node type renders escaped", async () => {
+  const LINKS = kvStub();
+  const nasty = '"><script>alert(1)</script>';
+  const cases = [
+    "https://nanoodle.com/play#a=u" + b64url(JSON.stringify({ v: 1, graph: GRAPH, name: nasty })),
+    "https://nanoodle.com/#j=" + b64url(JSON.stringify({
+      v: 1,
+      nodes: [{ id: "n1", type: nasty, x: 0, y: 0, fields: {} }],
+      links: [],
+    })),
+  ];
+  for (const url of cases) {
+    const { slug } = await (await postLink({ LINKS }, { url })).json();
+    const page = await (await call({ LINKS }, `/${slug}`)).text();
+    assert.ok(!page.includes(nasty), "raw payload must not appear");
+    assert.ok(page.includes("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"), "escaped form appears");
+    // Still exactly the one intentional inline script.
+    assert.equal(page.split("<script>").length - 1, 1);
+  }
 });

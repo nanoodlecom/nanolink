@@ -4,15 +4,21 @@
 // Routes:
 //   POST /api/links            {url} -> {slug, shortUrl}
 //   GET  /api/links/<slug>     -> {url}                     (peek)
-//   GET  /<slug>               -> 200 HTML body-bounce page
+//   GET  /<slug>               -> 200 HTML body-bounce page (with OG card)
 //   GET  /                     -> tiny landing page
 //
-// No logging, no analytics, no cookies — nothing beyond the slug -> url pair
-// is ever stored, and nothing at all is recorded when a link is followed.
+// No logging, no analytics, no cookies — nothing beyond the slug -> record
+// pair is ever stored, and nothing at all is recorded when a link is
+// followed. The record is {url, title, desc}: card metadata is derived once,
+// at store time, from the workflow already encoded in the URL fragment —
+// no extra data collected. v1 stored the bare URL string; reads accept both.
 
 import {
   validateTarget,
   slugFor,
+  deriveCardMeta,
+  packRecord,
+  parseRecord,
   bouncePage,
   notFoundPage,
   homePage,
@@ -88,7 +94,11 @@ export default {
       // (A concurrent duplicate put is harmless — it writes the same value.)
       const existing = await env.LINKS.get(slug);
       if (existing === null) {
-        await env.LINKS.put(slug, body.url);
+        // Best-effort card metadata from the URL fragment. deriveCardMeta
+        // never throws — a malformed fragment stores null metadata and the
+        // bounce page serves the generic card.
+        const meta = await deriveCardMeta(body.url);
+        await env.LINKS.put(slug, packRecord(body.url, meta));
       }
       return json({ slug, shortUrl: `${url.origin}/${slug}` });
     }
@@ -99,11 +109,11 @@ export default {
       if (request.method !== "GET") {
         return json({ error: "method not allowed" }, 405);
       }
-      const target = SLUG_RE.test(peek[1]) ? await env.LINKS.get(peek[1]) : null;
-      if (target === null) {
+      const raw = SLUG_RE.test(peek[1]) ? await env.LINKS.get(peek[1]) : null;
+      if (raw === null) {
         return json({ error: "not found" }, 404);
       }
-      return json({ url: target });
+      return json({ url: parseRecord(raw).url });
     }
 
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -119,11 +129,18 @@ export default {
     // response headers over ~10KB; nanoodle share links can be 10–60KB).
     const seg = path.slice(1);
     if (SLUG_RE.test(seg)) {
-      const target = await env.LINKS.get(seg);
-      if (target !== null) {
+      const raw = await env.LINKS.get(seg);
+      if (raw !== null) {
+        // parseRecord handles both the v2 {url, title, desc} record and
+        // legacy v1 values (the bare URL string).
+        const rec = parseRecord(raw);
         // Slug content is immutable by construction (slug = hash of url),
         // so the page can be cached forever.
-        return html(bouncePage(target), 200, "public, max-age=31536000, immutable");
+        return html(
+          bouncePage(rec.url, { shortUrl: `${url.origin}/${seg}`, title: rec.title, desc: rec.desc }),
+          200,
+          "public, max-age=31536000, immutable",
+        );
       }
     }
     return html(notFoundPage(), 404, "no-store");

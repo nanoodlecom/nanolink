@@ -45,6 +45,11 @@ Rules:
   `https://nanoodle.com.evil.tld/...` is rejected.
 - The slug is the first 8 chars of `base64url(SHA-256(url))`. **Deterministic**:
   the same link always yields the same slug, and is only stored once.
+- The KV value is a JSON record `{"url", "title", "desc"}` — `title`/`desc`
+  are card metadata best-effort derived from the workflow already encoded in
+  the URL fragment (see *Rich link previews*), or `null` when the fragment
+  can't be decoded. Values written by v1 were the bare URL string; reads
+  accept both shapes forever, so existing links keep working unchanged.
 - Errors return `4xx` with `{"error": "..."}`.
 - CORS: browser calls are allowed from `https://nanoodle.com` only
   (`OPTIONS` preflight handled).
@@ -62,6 +67,37 @@ slugs get an uncached 404 page.
 
 Peek without bouncing: `200 {"url": "..."}` or `404 {"error": "not found"}`.
 Same CORS policy as `POST`.
+
+## Rich link previews
+
+Short links posted to X/Reddit/Discord/Slack render a card instead of a naked
+URL: the bounce page carries Open Graph + Twitter tags (`og:title`,
+`og:description`, `og:site_name`, `og:type`, `og:url` pointing at the short
+link, `og:image` = nanoodle.com's 1200×630 social card, and
+`twitter:card: summary_large_image`).
+
+The title is derived **once, at store time**, from the workflow already
+encoded in the shared URL's fragment — no fetch, no extra data:
+
+- `#a=` / `#a=u` (app links): the app's `name`, else the `<title>` of its
+  packed `index.html`, else the graph chain below.
+- `#g=` / `#j=` (graph links): a node-type chain like `text → llm → image`,
+  in topological-ish order. Capped at 70 chars.
+- Anything undecodable (or no fragment): a generic "A nanoodle workflow"
+  card. A malformed fragment can never fail link creation.
+
+The description is a fixed brand line for every card. Titles and
+descriptions derive from user-supplied graph JSON, so they are HTML-escaped
+before hitting the page.
+
+**How this works with the body bounce:** card scrapers read the first HTML
+response, and `GET /<slug>` serves the full page — OG tags included — with
+the first byte; the meta-refresh/JS bounce doesn't get in the way of that.
+One honest caveat: some scrapers (Facebook, and a few link-preview bots)
+*follow* `<meta http-equiv="refresh">` and scrape the destination instead.
+For nanolink that destination is nanoodle.com itself, which serves its own
+site-wide OG tags — so those platforms show the generic nanoodle card rather
+than the per-workflow title. No platform shows a broken preview.
 
 ## Deploy
 
@@ -85,7 +121,9 @@ npm test
   shortener sees your workflow.
 - **No logs, no analytics, no cookies.** The worker records nothing about who
   created or followed a link. Workers observability is explicitly disabled in
-  `wrangler.jsonc`. The only stored data is the `slug → url` pair itself.
+  `wrangler.jsonc`. The only stored data is the `slug → {url, title, desc}`
+  record — and the title/desc are computed from the URL itself, not from any
+  request context.
 - **No duplicate storage.** Deterministic slugs mean re-shortening the same
   link is a no-op — there is no per-request record to accumulate.
 - `Referrer-Policy: no-referrer` on the bounce page, so the short URL isn't
