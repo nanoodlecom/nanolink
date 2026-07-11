@@ -1,0 +1,14 @@
+{
+  "name": "nanolink",
+  "private": true,
+  "version": "0.1.0",
+  "description": "First-party, zero-analytics link shortener for nanoodle share links — Cloudflare Worker + KV, body-bounce instead of Location redirects.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

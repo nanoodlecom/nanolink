@@ -1,0 +1,7 @@
+node_modules/
+nanoodle-out/
+.env
+.env.*
+.wrangler/
+*.log
+test/fixtures/generated/
