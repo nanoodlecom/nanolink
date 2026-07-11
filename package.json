@@ -5,6 +5,9 @@
   "description": "First-party, zero-analytics link shortener for nanoodle share links — Cloudflare Worker + KV, body-bounce instead of Location redirects, rich OG link previews.",
   "type": "module",
   "license": "MIT",
+  "repository": "github:nanoodlecom/nanolink",
+  "homepage": "https://github.com/nanoodlecom/nanolink#readme",
+  "bugs": "https://github.com/nanoodlecom/nanolink/issues",
   "engines": {
     "node": ">=20"
   },

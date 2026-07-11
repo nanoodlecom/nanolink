@@ -259,6 +259,26 @@ export function parseRecord(raw) {
   return { url: raw, title: null, desc: null };
 }
 
+/**
+ * The one intentional inline script on the bounce page. Factored out so the
+ * worker can compute a CSP sha256 hash over the *exact* source that
+ * bouncePage emits — the hash allowlists this script and nothing else, so
+ * even a hypothetical escaping bug could not execute injected script.
+ */
+export function bounceScript(url) {
+  return `location.replace("${escapeJsString(url)}");`;
+}
+
+/**
+ * CSP source expression ('sha256-…', standard base64) for an inline script.
+ */
+export async function inlineScriptHash(source) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
+  let bin = "";
+  for (const b of new Uint8Array(digest)) bin += String.fromCharCode(b);
+  return `'sha256-${btoa(bin)}'`;
+}
+
 const PAGE_CSS = `
   :root { color-scheme: light dark; }
   body {
@@ -296,7 +316,6 @@ const PAGE_CSS = `
  */
 export function bouncePage(url, card = {}) {
   const attr = escapeHtml(url);
-  const js = escapeJsString(url);
   const title = escapeHtml(card.title || GENERIC_TITLE);
   const desc = escapeHtml(card.desc || CARD_DESC);
   const ogUrl = card.shortUrl ? `\n<meta property="og:url" content="${escapeHtml(card.shortUrl)}">` : "";
@@ -316,7 +335,7 @@ export function bouncePage(url, card = {}) {
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <style>${PAGE_CSS}</style>
-<script>location.replace("${js}");</script>
+<script>${bounceScript(url)}</script>
 <main>
   <h1>Opening your noodle…</h1>
   <a class="go" href="${attr}">Continue to nanoodle &rarr;</a>

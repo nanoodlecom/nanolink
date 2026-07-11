@@ -2,7 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
 import worker from "../src/worker.mjs";
-import { slugFor, MAX_URL_LENGTH, CARD_DESC, GENERIC_TITLE } from "../src/lib.mjs";
+import {
+  slugFor,
+  inlineScriptHash,
+  MAX_URL_LENGTH,
+  CARD_DESC,
+  GENERIC_TITLE,
+} from "../src/lib.mjs";
 
 // Minimal in-memory stand-in for a Workers KV namespace (the two methods the
 // worker uses). Counts puts so dedupe behavior is observable.
@@ -118,12 +124,23 @@ test("GET /<slug> returns a 200 body-bounce page, not a redirect", async () => {
   assert.match(res.headers.get("content-type"), /text\/html/);
   assert.equal(res.headers.get("referrer-policy"), "no-referrer");
   assert.equal(res.headers.get("cache-control"), "public, max-age=31536000, immutable");
+  assert.equal(res.headers.get("x-content-type-options"), "nosniff");
 
   const page = await res.text();
   assert.ok(page.includes(GOOD_URL)); // GOOD_URL has no HTML-special chars
   assert.match(page, /http-equiv="refresh"/);
   assert.match(page, /location\.replace\(/);
   assert.match(page, /Continue to nanoodle/);
+
+  // CSP: locked down, and the only allowed script is the page's own inline
+  // bounce script, allowlisted by the sha256 of its exact emitted source.
+  const cspHeader = res.headers.get("content-security-policy");
+  assert.match(cspHeader, /default-src 'none'/);
+  assert.match(cspHeader, /base-uri 'none'/);
+  const scriptSrc = cspHeader.match(/script-src ('sha256-[A-Za-z0-9+/=]+')/)?.[1];
+  assert.ok(scriptSrc, "script-src is hash-based, not unsafe-inline");
+  const source = page.match(/<script>([\s\S]*?)<\/script>/)[1];
+  assert.equal(scriptSrc, await inlineScriptHash(source), "hash covers the emitted script");
 });
 
 test("GET unknown slug is an uncached 404 page", async () => {
@@ -147,6 +164,16 @@ test("GET / serves the landing page", async () => {
   const res = await call({ LINKS: kvStub() }, "/");
   assert.equal(res.status, 200);
   assert.match(await res.text(), /nanolink/);
+});
+
+test("scriptless pages (home, 404) get a CSP with no script-src at all", async () => {
+  for (const p of ["/", "/AAAAAAAA"]) {
+    const res = await call({ LINKS: kvStub() }, p);
+    const cspHeader = res.headers.get("content-security-policy");
+    assert.match(cspHeader, /default-src 'none'/, p);
+    assert.ok(!cspHeader.includes("script-src"), p);
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff", p);
+  }
 });
 
 // --- GET /api/links/<slug> (peek) ----------------------------------------------

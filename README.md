@@ -58,10 +58,15 @@ Rules:
 
 Returns the body-bounce page (`200 text/html`): `<meta http-equiv="refresh">`,
 inline `location.replace(...)`, and a visible "Continue to nanoodle →" link.
-Sent with `Referrer-Policy: no-referrer`, `noindex`, and
+Sent with `Referrer-Policy: no-referrer`, `noindex`,
+`X-Content-Type-Options: nosniff`, and
 `Cache-Control: public, max-age=31536000, immutable` — safe because a slug's
-content is immutable by construction (it *is* the hash of the URL). Unknown
-slugs get an uncached 404 page.
+content is immutable by construction (it *is* the hash of the URL). Every HTML
+response also carries a `Content-Security-Policy` of `default-src 'none'`;
+the bounce page's single inline script is allowlisted by the sha256 hash of
+its exact emitted source (not `'unsafe-inline'`), so even a hypothetical
+escaping bug couldn't execute injected script. Unknown slugs get an uncached
+404 page.
 
 ### `GET /api/links/<slug>`
 
@@ -140,6 +145,17 @@ this repo depends on that PR — the API above is the whole contract.
 
 - **No delete/expiry.** Links live until the KV pair is removed by hand
   (`wrangler kv key delete`). Fine for share links; not a general shortener.
+- **Takedown needs a cache purge too.** Bounce pages are edge-cached for a
+  year (`immutable`), so deleting the KV key does **not** retract a bounce
+  page an edge location has already cached — to fully take a link down,
+  also purge the short URL from the Cloudflare cache (dashboard → Caching →
+  Custom Purge, or the `purge_cache` API).
+- **No rate limit on `POST /api/links`.** Any caller who can reach the
+  endpoint can mint unlimited distinct KV records (up to 128 KiB each) —
+  the CORS allowlist only gates *browsers*, not server-side callers. KV
+  storage abuse is the exposure. If that matters for your deployment, put a
+  Cloudflare rate-limiting rule (WAF → Rate limiting) in front of
+  `POST /api/links`.
 - **8-char slugs are truncated hashes**, not unguessable secrets. Anyone who
   can guess or observe a slug can read the link — same as any shortener.
   Don't shorten links you consider private.

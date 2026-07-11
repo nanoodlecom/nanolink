@@ -20,6 +20,8 @@ import {
   packRecord,
   parseRecord,
   bouncePage,
+  bounceScript,
+  inlineScriptHash,
   notFoundPage,
   homePage,
   SLUG_RE,
@@ -44,11 +46,29 @@ function json(body, status = 200) {
   });
 }
 
-function html(body, status, cacheControl) {
+/**
+ * Content-Security-Policy for the HTML pages. Everything is locked down
+ * (`default-src 'none'`; the pages' only styling is the inline <style>). The
+ * bounce page additionally allowlists its single inline script by sha256
+ * hash (`scriptSrc`) — no other script, inline or external, can execute even
+ * if an escaping bug ever slipped user data into the markup. The home/404
+ * pages have no script at all, so they get no script-src.
+ */
+function csp(scriptSrc) {
+  return (
+    "default-src 'none'; " +
+    (scriptSrc ? `script-src ${scriptSrc}; ` : "") +
+    "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+  );
+}
+
+function html(body, status, cacheControl, scriptSrc) {
   return new Response(body, {
     status,
     headers: {
       "content-type": "text/html; charset=utf-8",
+      "content-security-policy": csp(scriptSrc),
+      "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
       "cache-control": cacheControl,
       "x-robots-tag": "noindex",
@@ -140,6 +160,7 @@ export default {
           bouncePage(rec.url, { shortUrl: `${url.origin}/${seg}`, title: rec.title, desc: rec.desc }),
           200,
           "public, max-age=31536000, immutable",
+          await inlineScriptHash(bounceScript(rec.url)),
         );
       }
     }
