@@ -7,6 +7,11 @@ third party ever seeing the workflow.
 
 Zero dependencies. One worker file, one KV namespace.
 
+This is self-hostable infrastructure, not a hosted service: the nanoodle
+editor doesn't use it yet (that integration is a future PR — see *Integrating
+with nanoodle*), and there is no official public instance. Deploy your own,
+or watch this repo.
+
 ## Why this exists
 
 nanoodle share links carry the **whole workflow in the URL fragment** and can
@@ -21,6 +26,11 @@ size limit. Being first-party also means no shortener service ever sees the
 workflow encoded in the link.
 
 ## API
+
+### `GET /`
+
+A tiny static landing page (`200 text/html`, cached for an hour) naming the
+service and linking to nanoodle.com — no script, nothing dynamic.
 
 ### `POST /api/links`
 
@@ -163,7 +173,7 @@ this repo depends on that PR — the API above is the whole contract.
   off `nanoodle.com` / `www.nanoodle.com`.
 - **KV is eventually consistent** — a freshly created link can take a few
   seconds to resolve from a different edge location.
-- Collisions across ~4×10¹⁴ slug values are theoretically possible but not
+- Collisions across the 64⁸ = 2⁴⁸ ≈ 2.8×10¹⁴ slug values are theoretically possible but not
   handled specially; a colliding URL would resolve to the first-stored link.
 
 ## License
