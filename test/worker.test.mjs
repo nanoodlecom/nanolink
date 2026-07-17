@@ -4,10 +4,13 @@ import { gzipSync } from "node:zlib";
 import worker from "../src/worker.mjs";
 import {
   slugFor,
+  cardKey,
   inlineScriptHash,
   MAX_URL_LENGTH,
   CARD_DESC,
   GENERIC_TITLE,
+  CARD_WIDTH,
+  CARD_HEIGHT,
 } from "../src/lib.mjs";
 
 // Minimal in-memory stand-in for a Workers KV namespace (the two methods the
@@ -17,8 +20,16 @@ function kvStub() {
   return {
     store,
     puts: 0,
-    async get(key) {
-      return store.has(key) ? store.get(key) : null;
+    async get(key, type) {
+      if (!store.has(key)) return null;
+      const value = store.get(key);
+      // Mirror real KV: "arrayBuffer" reads return an ArrayBuffer.
+      if (type === "arrayBuffer") {
+        return value instanceof Uint8Array
+          ? value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)
+          : new TextEncoder().encode(value).buffer;
+      }
+      return value;
     },
     async put(key, value) {
       this.puts += 1;
@@ -309,4 +320,90 @@ test("XSS attempt in app name / node type renders escaped", async () => {
     // Still exactly the one intentional inline script.
     assert.equal(page.split("<script>").length - 1, 1);
   }
+});
+
+// --- v3: uploaded card PNGs ---------------------------------------------------
+
+// Just enough PNG to pass validateCard: signature + IHDR dims.
+function pngBytes(w = CARD_WIDTH, h = CARD_HEIGHT) {
+  const bytes = new Uint8Array(64);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(8, 13);
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12); // "IHDR"
+  view.setUint32(16, w);
+  view.setUint32(20, h);
+  return bytes;
+}
+
+const CARD_B64 = Buffer.from(pngBytes()).toString("base64");
+
+test("POST with card stores the PNG; bounce + og.png serve it", async () => {
+  const LINKS = kvStub();
+  const { slug } = await (await postLink({ LINKS }, { url: GRAPH_URL, card: CARD_B64 })).json();
+
+  // Record carries the img flag; the PNG sits under img:<slug>.
+  assert.equal(JSON.parse(LINKS.store.get(slug)).img, true);
+  assert.ok(LINKS.store.get(cardKey(slug)) instanceof Uint8Array);
+
+  // Bounce page points og:image at the per-slug card, not the shared one.
+  const page = await (await call({ LINKS }, `/${slug}`)).text();
+  assert.ok(page.includes(`<meta property="og:image" content="${BASE}/${slug}/og.png">`));
+  assert.ok(!page.includes("https://nanoodle.com/og-card.png"));
+
+  // The image route serves it immutably.
+  const res = await call({ LINKS }, `/${slug}/og.png`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "image/png");
+  assert.equal(res.headers.get("cache-control"), "public, max-age=31536000, immutable");
+  assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(new Uint8Array(await res.arrayBuffer()), pngBytes());
+});
+
+test("POST without card keeps the shared brand image", async () => {
+  const LINKS = kvStub();
+  const { slug } = await (await postLink({ LINKS }, { url: GRAPH_URL })).json();
+  assert.equal(JSON.parse(LINKS.store.get(slug)).img, undefined);
+  const page = await (await call({ LINKS }, `/${slug}`)).text();
+  assert.ok(page.includes('<meta property="og:image" content="https://nanoodle.com/og-card.png">'));
+  assert.equal((await call({ LINKS }, `/${slug}/og.png`)).status, 404);
+});
+
+test("POST rejects invalid cards without storing anything", async () => {
+  const LINKS = kvStub();
+  const cases = [
+    "!!!not base64!!!",
+    Buffer.from(pngBytes(640, 480)).toString("base64"),
+    Buffer.from("definitely not a png but long enough to check").toString("base64"),
+    42,
+  ];
+  for (const card of cases) {
+    const res = await postLink({ LINKS }, { url: GRAPH_URL, card });
+    assert.equal(res.status, 400, String(card).slice(0, 30));
+  }
+  assert.equal(LINKS.puts, 0);
+});
+
+test("card is only honored at slug creation, never attached later", async () => {
+  const LINKS = kvStub();
+  // Victim creates the link (no card, e.g. an older client).
+  const { slug } = await (await postLink({ LINKS }, { url: GRAPH_URL })).json();
+  // Attacker re-posts the same public URL with their own image.
+  const res = await postLink({ LINKS }, { url: GRAPH_URL, card: CARD_B64 });
+  assert.equal(res.status, 200);
+  assert.equal(LINKS.store.has(cardKey(slug)), false, "no image stored");
+  assert.equal(JSON.parse(LINKS.store.get(slug)).img, undefined, "record unchanged");
+  const page = await (await call({ LINKS }, `/${slug}`)).text();
+  assert.ok(page.includes("https://nanoodle.com/og-card.png"));
+});
+
+test("og.png for unknown or malformed slugs is 404 and never hits KV on junk", async () => {
+  const LINKS = kvStub();
+  assert.equal((await call({ LINKS }, "/AAAAAAAA/og.png")).status, 404);
+  let gets = 0;
+  LINKS.get = async () => (gets++, null);
+  for (const p of ["/short/og.png", "/way-too-long-slug/og.png", "/AAAA*AAA/og.png"]) {
+    assert.equal((await call({ LINKS }, p)).status, 404, p);
+  }
+  assert.equal(gets, 0);
 });

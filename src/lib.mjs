@@ -99,6 +99,67 @@ export const GENERIC_TITLE = "A nanoodle workflow";
 /** nanoodle.com's social card image (1200×630 — large-format). */
 export const CARD_IMAGE = "https://nanoodle.com/og-card.png";
 
+/** Required pixel size for an uploaded per-link card (the OG large format). */
+export const CARD_WIDTH = 1200;
+export const CARD_HEIGHT = 630;
+
+/** Hard ceiling on an uploaded card PNG (decoded bytes). */
+export const MAX_CARD_BYTES = 200 * 1024;
+
+/** KV key holding the card PNG for a slug. ":" is outside the slug alphabet,
+ *  so these keys can never collide with slug records. */
+export function cardKey(slug) {
+  return `img:${slug}`;
+}
+
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+/**
+ * Validate a client-rendered card image (base64-encoded PNG). Strict on
+ * purpose: exact PNG magic, exact IHDR 1200×630, hard byte ceiling — the
+ * endpoint is unauthenticated, so anything looser turns KV into a free
+ * image host.
+ *
+ * @returns {{ok: true, bytes: Uint8Array} | {ok: false, reason: string}}
+ */
+export function validateCard(b64) {
+  if (typeof b64 !== "string") {
+    return { ok: false, reason: "card must be a base64 string" };
+  }
+  // 4/3 base64 expansion plus padding slack — rejects oversized payloads
+  // before spending time decoding them.
+  if (b64.length > Math.ceil(MAX_CARD_BYTES / 3) * 4 + 4) {
+    return { ok: false, reason: `card must be at most ${MAX_CARD_BYTES} bytes` };
+  }
+  let bytes;
+  try {
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch {
+    return { ok: false, reason: "card must be valid base64" };
+  }
+  if (bytes.length > MAX_CARD_BYTES) {
+    return { ok: false, reason: `card must be at most ${MAX_CARD_BYTES} bytes` };
+  }
+  // A PNG opens with the 8-byte signature followed immediately by the IHDR
+  // chunk: length(4) "IHDR"(4) width(4) height(4) — so 24 bytes in, the
+  // dimensions are right there.
+  if (bytes.length < 33 || !PNG_MAGIC.every((b, i) => bytes[i] === b)) {
+    return { ok: false, reason: "card must be a PNG" };
+  }
+  if (String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]) !== "IHDR") {
+    return { ok: false, reason: "card must be a PNG" };
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const w = view.getUint32(16);
+  const h = view.getUint32(20);
+  if (w !== CARD_WIDTH || h !== CARD_HEIGHT) {
+    return { ok: false, reason: `card must be ${CARD_WIDTH}×${CARD_HEIGHT}` };
+  }
+  return { ok: true, bytes };
+}
+
 /** Longest og:title we emit. */
 export const MAX_TITLE_LENGTH = 70;
 
@@ -230,18 +291,21 @@ export async function deriveCardMeta(url) {
 
 // --- KV record shape ----------------------------------------------------------
 //
+// v3 adds an optional `img: true` flag (a card PNG exists at img:<slug>);
 // v2 stores a JSON object per slug; v1 stored the bare URL string. Reads
-// accept both forever — existing links keep working.
+// accept all three forever — existing links keep working.
 
-/** Serialize a record for KV. */
-export function packRecord(url, meta) {
-  return JSON.stringify({ url, title: meta?.title ?? null, desc: meta?.desc ?? null });
+/** Serialize a record for KV. `img` marks that a card PNG is stored. */
+export function packRecord(url, meta, img = false) {
+  const rec = { url, title: meta?.title ?? null, desc: meta?.desc ?? null };
+  if (img) rec.img = true;
+  return JSON.stringify(rec);
 }
 
 /**
- * Parse a KV value into {url, title, desc}. Handles the v2 JSON shape and
- * legacy v1 values, which were the plain URL string (always "https://…",
- * never "{…", so the two are unambiguous).
+ * Parse a KV value into {url, title, desc, img}. Handles the v2/v3 JSON
+ * shape and legacy v1 values, which were the plain URL string (always
+ * "https://…", never "{…", so the two are unambiguous).
  */
 export function parseRecord(raw) {
   if (typeof raw === "string" && raw.startsWith("{")) {
@@ -252,11 +316,12 @@ export function parseRecord(raw) {
           url: rec.url,
           title: typeof rec.title === "string" ? rec.title : null,
           desc: typeof rec.desc === "string" ? rec.desc : null,
+          img: rec.img === true,
         };
       }
     } catch { /* fall through to legacy */ }
   }
-  return { url: raw, title: null, desc: null };
+  return { url: raw, title: null, desc: null, img: false };
 }
 
 /**
@@ -310,14 +375,16 @@ const PAGE_CSS = `
  *
  * `card` (all optional) drives the Open Graph / Twitter tags so the short
  * link renders a rich preview on X/Reddit/Discord/Slack:
- *   {shortUrl, title, desc} — title/desc derive from user-supplied graph
- * JSON, so both are HTML-escaped here; missing pieces fall back to the
- * generic card.
+ *   {shortUrl, title, desc, image} — title/desc derive from user-supplied
+ * graph JSON, so both are HTML-escaped here; missing pieces fall back to
+ * the generic card. `image` is the per-slug card PNG URL when one was
+ * uploaded at creation time, else the shared brand card.
  */
 export function bouncePage(url, card = {}) {
   const attr = escapeHtml(url);
   const title = escapeHtml(card.title || GENERIC_TITLE);
   const desc = escapeHtml(card.desc || CARD_DESC);
+  const image = escapeHtml(card.image || CARD_IMAGE);
   const ogUrl = card.shortUrl ? `\n<meta property="og:url" content="${escapeHtml(card.shortUrl)}">` : "";
   return `<!doctype html>
 <html lang="en">
@@ -330,7 +397,7 @@ export function bouncePage(url, card = {}) {
 <meta property="og:type" content="website">
 <meta property="og:title" content="${title}">
 <meta property="og:description" content="${desc}">${ogUrl}
-<meta property="og:image" content="${CARD_IMAGE}">
+<meta property="og:image" content="${image}">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">

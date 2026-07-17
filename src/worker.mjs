@@ -2,19 +2,24 @@
 // links. Cloudflare Worker + KV (binding: LINKS).
 //
 // Routes:
-//   POST /api/links            {url} -> {slug, shortUrl}
+//   POST /api/links            {url, card?} -> {slug, shortUrl}
 //   GET  /api/links/<slug>     -> {url}                     (peek)
 //   GET  /<slug>               -> 200 HTML body-bounce page (with OG card)
+//   GET  /<slug>/og.png        -> the card PNG uploaded at creation, if any
 //   GET  /                     -> tiny landing page
 //
 // No logging, no analytics, no cookies — nothing beyond the slug -> record
-// pair is ever stored, and nothing at all is recorded when a link is
-// followed. The record is {url, title, desc}: card metadata is derived once,
-// at store time, from the workflow already encoded in the URL fragment —
-// no extra data collected. v1 stored the bare URL string; reads accept both.
+// pair (plus, when the client rendered one at share time, a card PNG under
+// img:<slug>) is ever stored, and nothing at all is recorded when a link is
+// followed. The record is {url, title, desc, img?}: card metadata is derived
+// once, at store time, from the workflow already encoded in the URL fragment
+// — no extra data collected. v1 stored the bare URL string; reads accept all
+// shapes.
 
 import {
   validateTarget,
+  validateCard,
+  cardKey,
   slugFor,
   deriveCardMeta,
   packRecord,
@@ -109,6 +114,18 @@ export default {
       if (!verdict.ok) {
         return json({ error: verdict.reason }, 400);
       }
+      // Optional client-rendered card PNG (base64). Validated strictly, and
+      // honored only when the slug is first created (below) — accepting it
+      // later would let anyone who knows a public share URL attach a new
+      // image to someone else's already-circulating short link.
+      let card = null;
+      if (body.card !== undefined && body.card !== null) {
+        const cardVerdict = validateCard(body.card);
+        if (!cardVerdict.ok) {
+          return json({ error: cardVerdict.reason }, 400);
+        }
+        card = cardVerdict.bytes;
+      }
       const slug = await slugFor(body.url);
       // Deterministic slug: same url -> same slug, so only store once.
       // (A concurrent duplicate put is harmless — it writes the same value.)
@@ -118,7 +135,10 @@ export default {
         // never throws — a malformed fragment stores null metadata and the
         // bounce page serves the generic card.
         const meta = await deriveCardMeta(body.url);
-        await env.LINKS.put(slug, packRecord(body.url, meta));
+        if (card) {
+          await env.LINKS.put(cardKey(slug), card);
+        }
+        await env.LINKS.put(slug, packRecord(body.url, meta, card !== null));
       }
       return json({ slug, shortUrl: `${url.origin}/${slug}` });
     }
@@ -144,6 +164,25 @@ export default {
       return html(homePage(), 200, "public, max-age=3600");
     }
 
+    // GET /<slug>/og.png — the card PNG uploaded when the link was created.
+    // Immutable like the bounce page: a card is only ever written once, at
+    // slug creation.
+    const og = path.match(/^\/([^/]+)\/og\.png$/);
+    if (og && SLUG_RE.test(og[1])) {
+      const img = await env.LINKS.get(cardKey(og[1]), "arrayBuffer");
+      if (img !== null) {
+        return new Response(request.method === "HEAD" ? null : img, {
+          status: 200,
+          headers: {
+            "content-type": "image/png",
+            "cache-control": "public, max-age=31536000, immutable",
+            "x-content-type-options": "nosniff",
+          },
+        });
+      }
+      return html(notFoundPage(), 404, "no-store");
+    }
+
     // GET /<slug> — the body bounce. The long URL travels in the response
     // body, never in a Location header (Cloudflare's h3 edge stalls on
     // response headers over ~10KB; nanoodle share links can be 10–60KB).
@@ -157,7 +196,12 @@ export default {
         // Slug content is immutable by construction (slug = hash of url),
         // so the page can be cached forever.
         return html(
-          bouncePage(rec.url, { shortUrl: `${url.origin}/${seg}`, title: rec.title, desc: rec.desc }),
+          bouncePage(rec.url, {
+            shortUrl: `${url.origin}/${seg}`,
+            title: rec.title,
+            desc: rec.desc,
+            image: rec.img ? `${url.origin}/${seg}/og.png` : undefined,
+          }),
           200,
           "public, max-age=31536000, immutable",
           await inlineScriptHash(bounceScript(rec.url)),

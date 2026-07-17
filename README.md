@@ -39,7 +39,7 @@ service and linking to nanoodle.com — no script, nothing dynamic.
 POST /api/links
 Content-Type: application/json
 
-{"url": "https://nanoodle.com/play#a=..."}
+{"url": "https://nanoodle.com/play#a=...", "card": "<base64 PNG, optional>"}
 ```
 
 Response:
@@ -56,11 +56,20 @@ Rules:
   `https://nanoodle.com.evil.tld/...` is rejected.
 - The slug is the first 8 chars of `base64url(SHA-256(url))`. **Deterministic**:
   the same link always yields the same slug, and is only stored once.
-- The KV value is a JSON record `{"url", "title", "desc"}` — `title`/`desc`
-  are card metadata best-effort derived from the workflow already encoded in
-  the URL fragment (see *Rich link previews*), or `null` when the fragment
-  can't be decoded. Values written by v1 were the bare URL string; reads
-  accept both shapes forever, so existing links keep working unchanged.
+- The KV value is a JSON record `{"url", "title", "desc", "img"?}` —
+  `title`/`desc` are card metadata best-effort derived from the workflow
+  already encoded in the URL fragment (see *Rich link previews*), or `null`
+  when the fragment can't be decoded. Values written by v1 were the bare URL
+  string; reads accept all shapes forever, so existing links keep working
+  unchanged.
+- `card` (optional) is a client-rendered preview image for the link: a
+  base64-encoded PNG, **exactly 1200×630**, at most **200 KiB** decoded
+  (checked against the PNG signature and IHDR — anything else is a `400`).
+  It is stored under `img:<slug>` and served as the link's `og:image`.
+  **Honored only when the slug is first created**: accepting it later would
+  let anyone who knows a public share URL attach a new image to someone
+  else's already-circulating short link. Re-posting an existing URL with a
+  card silently ignores the card.
 - Errors return `4xx` with `{"error": "..."}`.
 - CORS: browser calls are allowed from `https://nanoodle.com` only
   (`OPTIONS` preflight handled).
@@ -79,6 +88,12 @@ its exact emitted source (not `'unsafe-inline'`), so even a hypothetical
 escaping bug couldn't execute injected script. Unknown slugs get an uncached
 404 page.
 
+### `GET /<slug>/og.png`
+
+The card PNG uploaded when the link was created (`200 image/png`, immutable —
+a card is only ever written at slug creation), or a 404 for links that were
+created without one.
+
 ### `GET /api/links/<slug>`
 
 Peek without bouncing: `200 {"url": "..."}` or `404 {"error": "not found"}`.
@@ -89,8 +104,11 @@ Same CORS policy as `POST`.
 Short links posted to X/Reddit/Discord/Slack render a card instead of a naked
 URL: the bounce page carries Open Graph + Twitter tags (`og:title`,
 `og:description`, `og:site_name`, `og:type`, `og:url` pointing at the short
-link, `og:image` = nanoodle.com's 1200×630 social card, and
-`twitter:card: summary_large_image`).
+link, `og:image`, and `twitter:card: summary_large_image`). `og:image` is the
+per-link card at `/<slug>/og.png` when the creating client uploaded one — the
+nanoodle editor renders a 1200×630 picture of the workflow's *structure*
+(node cards and wires, never field contents or media) at share time — and
+falls back to nanoodle.com's shared 1200×630 social card otherwise.
 
 The title is derived **once, at store time**, from the workflow already
 encoded in the shared URL's fragment — no fetch, no extra data:
@@ -190,11 +208,15 @@ contract.
   also purge the short URL from the Cloudflare cache (dashboard → Caching →
   Custom Purge, or the `purge_cache` API).
 - **No rate limit on `POST /api/links`.** Any caller who can reach the
-  endpoint can mint unlimited distinct KV records (up to 128 KiB each) —
-  the CORS allowlist only gates *browsers*, not server-side callers. KV
-  storage abuse is the exposure. If that matters for your deployment, put a
-  Cloudflare rate-limiting rule (WAF → Rate limiting) in front of
-  `POST /api/links`.
+  endpoint can mint unlimited distinct KV records (up to 128 KiB each, plus
+  up to 200 KiB of card PNG per link) — the CORS allowlist only gates
+  *browsers*, not server-side callers. KV storage abuse is the exposure. If
+  that matters for your deployment, put a Cloudflare rate-limiting rule
+  (WAF → Rate limiting) in front of `POST /api/links`.
+- **Card images are caller-supplied.** The worker validates that a card is a
+  well-formed 1200×630 PNG, not what it depicts — whoever first shortens a
+  URL picks its preview image, same trust model as the derived title. It is
+  served with `image/png` + `nosniff`, so it can't execute as anything else.
 - **8-char slugs are truncated hashes**, not unguessable secrets. Anyone who
   can guess or observe a slug can read the link — same as any shortener.
   Don't shorten links you consider private.

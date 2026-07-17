@@ -9,6 +9,11 @@ import {
   CARD_DESC,
   GENERIC_TITLE,
   CARD_IMAGE,
+  CARD_WIDTH,
+  CARD_HEIGHT,
+  MAX_CARD_BYTES,
+  cardKey,
+  validateCard,
   validateTarget,
   slugFor,
   escapeHtml,
@@ -268,15 +273,18 @@ test("deriveCardMeta returns null on anything undecodable — never throws", asy
 test("packRecord/parseRecord round-trip, with and without metadata", () => {
   const url = "https://nanoodle.com/play#a=xyz";
   const meta = { title: "Ramen namer", desc: CARD_DESC };
-  assert.deepEqual(parseRecord(packRecord(url, meta)), { url, ...meta });
-  assert.deepEqual(parseRecord(packRecord(url, null)), { url, title: null, desc: null });
+  assert.deepEqual(parseRecord(packRecord(url, meta)), { url, ...meta, img: false });
+  assert.deepEqual(parseRecord(packRecord(url, null)), { url, title: null, desc: null, img: false });
+  assert.deepEqual(parseRecord(packRecord(url, meta, true)), { url, ...meta, img: true });
+  // v2 records (no img key) parse as img: false.
+  assert.equal(parseRecord(JSON.stringify({ url, title: null, desc: null })).img, false);
 });
 
 test("parseRecord handles legacy v1 plain-string values", () => {
   const url = "https://nanoodle.com/play#g=abc";
-  assert.deepEqual(parseRecord(url), { url, title: null, desc: null });
+  assert.deepEqual(parseRecord(url), { url, title: null, desc: null, img: false });
   // Even a pathological "{" prefix that isn't valid JSON falls back safely.
-  assert.deepEqual(parseRecord("{not json"), { url: "{not json", title: null, desc: null });
+  assert.deepEqual(parseRecord("{not json"), { url: "{not json", title: null, desc: null, img: false });
 });
 
 // --- bouncePage OG tags -----------------------------------------------------------
@@ -315,4 +323,58 @@ test("bouncePage escapes hostile card metadata", () => {
   assert.ok(!page.includes(nasty));
   assert.ok(page.includes("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
   assert.equal(page.split("<script>").length - 1, 1);
+});
+
+// --- v3: uploaded card PNGs -------------------------------------------------------
+
+// Just enough PNG for validateCard: signature + IHDR length/type/dims.
+function pngBytes(w = CARD_WIDTH, h = CARD_HEIGHT) {
+  const bytes = new Uint8Array(64);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(8, 13); // IHDR data length
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12); // "IHDR"
+  view.setUint32(16, w);
+  view.setUint32(20, h);
+  return bytes;
+}
+
+test("validateCard accepts a 1200×630 PNG and returns its bytes", () => {
+  const bytes = pngBytes();
+  const verdict = validateCard(Buffer.from(bytes).toString("base64"));
+  assert.equal(verdict.ok, true);
+  assert.deepEqual(verdict.bytes, bytes);
+});
+
+test("validateCard rejects non-strings, bad base64, non-PNGs, wrong dims, oversize", () => {
+  const cases = [
+    [42, "non-string"],
+    [null, "null"],
+    ["!!!not base64!!!", "bad base64"],
+    [Buffer.from("GIF89a not a png at all, needs 33+ bytes!").toString("base64"), "not a PNG"],
+    [Buffer.from(pngBytes().slice(0, 20)).toString("base64"), "truncated"],
+    [Buffer.from(pngBytes(800, 418)).toString("base64"), "wrong dims"],
+    [Buffer.from(pngBytes(CARD_WIDTH, CARD_HEIGHT + 1)).toString("base64"), "off-by-one height"],
+    ["A".repeat(Math.ceil(MAX_CARD_BYTES / 3) * 4 + 8), "encoded length over ceiling"],
+  ];
+  for (const [input, label] of cases) {
+    assert.equal(validateCard(input).ok, false, label);
+  }
+  // Exactly at the byte ceiling but not a PNG: rejected for content, and a
+  // real PNG padded past the ceiling is rejected for size.
+  const big = new Uint8Array(MAX_CARD_BYTES + 1);
+  big.set(pngBytes());
+  assert.match(validateCard(Buffer.from(big).toString("base64")).reason, /at most/);
+});
+
+test("cardKey namespaces outside the slug alphabet", () => {
+  assert.equal(cardKey("AAAAAAAA"), "img:AAAAAAAA");
+  assert.ok(!SLUG_RE.test(cardKey("AAAAAAAA")));
+});
+
+test("bouncePage points og:image at the per-slug card when given one", () => {
+  const image = "https://nnoodl.example/Qm3xY9_k/og.png";
+  const page = bouncePage("https://nanoodle.com/play#a=abc", { image });
+  assert.ok(page.includes(`<meta property="og:image" content="${image}">`));
+  assert.ok(!page.includes(CARD_IMAGE));
 });
