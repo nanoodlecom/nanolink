@@ -1,18 +1,20 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "nanolink",
-  "main": "src/worker.mjs",
-  "compatibility_date": "2026-06-20",
-  // No-logs policy: keep Workers observability/logging off.
-  "observability": {
-    "enabled": false
-  },
-  "kv_namespaces": [
-    // Create the namespace once, then paste its id here:
-    //   npx wrangler kv namespace create LINKS
-    {
-      "binding": "LINKS",
-      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
-    }
-  ]
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "nanolink",
+	"main": "src/worker.mjs",
+	"compatibility_date": "2026-06-20",
+	// The origin the nanoodle editor/play pages call (NANOLINK_ORIGIN).
+	"routes": [{ "pattern": "link.nanoodle.com", "custom_domain": true }],
+	// No-logs policy: keep Workers observability/logging off.
+	"observability": {
+		"enabled": false
+	},
+	"kv_namespaces": [
+		// Create the namespace once, then paste its id here:
+		//   npx wrangler kv namespace create LINKS
+		{
+			"binding": "LINKS",
+			"id": "40922876dff6431f978f4c132996034c"
+		}
+	]
 }
