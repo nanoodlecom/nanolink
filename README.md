@@ -7,10 +7,11 @@ third party ever seeing the workflow.
 
 Zero dependencies. One worker file, one KV namespace.
 
-This is self-hostable infrastructure, not a hosted service: the nanoodle
-editor doesn't use it yet (that integration is a future PR — see *Integrating
-with nanoodle*), and there is no official public instance. Deploy your own,
-or watch this repo.
+This is self-hostable infrastructure, not a hosted service. The nanoodle
+editor and app player now call this API for their Share → Shorten button
+(see *Integrating with nanoodle*), expecting the canonical instance at
+**`https://link.nanoodle.com`** — and degrading gracefully to the full-length
+link until that host is deployed. Deploy your own with the quickstart below.
 
 ## Why this exists
 
@@ -116,11 +117,26 @@ than the per-workflow title. No platform shows a broken preview.
 
 ## Deploy
 
+### Deploy for nanoodle.com — quickstart
+
+wrangler is not a dependency of this repo (the worker itself has zero
+dependencies) — `npx` fetches it on first use. From the repo root:
+
 ```bash
+npx wrangler login                       # opens the Cloudflare OAuth flow
 npx wrangler kv namespace create LINKS   # prints the namespace id
 # paste the id into wrangler.jsonc ("kv_namespaces" -> "id")
 npx wrangler deploy
 ```
+
+That gives you a live worker at `https://nanolink.<your-subdomain>.workers.dev`.
+Then (optional, but what the nanoodle pages expect by default): route the
+custom domain **link.nanoodle.com** to the worker in the Cloudflare dashboard
+(Workers & Pages → nanolink → Settings → Domains & Routes → Add → Custom
+domain). Keep the origin allowlists as is — `ALLOWED_ORIGINS` in `src/lib.mjs`
+(whose URLs may be *shortened*) and `ALLOW_ORIGIN` in `src/worker.mjs` (the
+CORS origin for browser calls) both point at nanoodle.com, and neither changes
+with the host the worker itself is served from.
 
 Run the tests (offline, no wrangler/miniflare needed — the worker is plain
 `fetch` in/out and Node ≥ 20 has `crypto.subtle`, `Request`, and `Response`
@@ -146,10 +162,23 @@ npm test
 
 ## Integrating with nanoodle
 
-The nanoodle editor's shorten popover currently uses third-party shorteners.
-The integration is a future PR in the main repo: POST the share link to this
-worker's `/api/links` instead, and use the returned `shortUrl`. Nothing in
-this repo depends on that PR — the API above is the whole contract.
+Both nanoodle surfaces — the editor (`index.html`, workflow `#g=` links) and
+the app player (`play.html`, app `#a=` links) — now call this worker from
+their Share popover's Shorten button, replacing the third-party shorteners
+(da.gd/TinyURL) they used before:
+
+- Each page declares the deployed worker as a single constant,
+  **`NANOLINK_ORIGIN`**, next to its shortener code. It defaults to the
+  canonical host `https://link.nanoodle.com`.
+- Shortening is `POST {NANOLINK_ORIGIN}/api/links` with `{"url": <long link>}`,
+  and the returned `shortUrl` is what gets copied/posted.
+- **Fallback:** on *any* failure — network error, non-2xx, or a ~5s timeout
+  (e.g. no instance deployed yet) — the pages simply keep offering the
+  full-length share link, exactly as if shortening had been skipped. The long
+  URL always works; nothing ever falls back to a third party.
+
+Nothing in this repo depends on the pages — the API above is the whole
+contract.
 
 ## Limitations
 
