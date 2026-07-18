@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # Zero npm deps, no lockfile — nothing to install. `npm test` runs
+      # `node --test`, which discovers BOTH suites (test/lib.test.mjs and
+      # test/worker.test.mjs). Offline only: the worker is exercised against
+      # in-memory KV mocks, never live Cloudflare.
+      - run: npm test
