@@ -157,7 +157,7 @@ CORS origin for browser calls) both point at nanoodle.com, and neither changes
 with the host the worker itself is served from.
 
 Run the tests (offline, no wrangler/miniflare needed — the worker is plain
-`fetch` in/out and Node ≥ 20 has `crypto.subtle`, `Request`, and `Response`
+`fetch` in/out and Node 22.23.4+, 24.22.1+, or 26.12.1+ has `crypto.subtle`, `Request`, and `Response`
 as globals):
 
 ```bash
