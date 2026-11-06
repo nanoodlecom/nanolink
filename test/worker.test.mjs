@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
 import worker from "../src/worker.mjs";
+import { creatorNamespace } from "../support/sqlite-fixture.mjs";
 import {
   slugFor,
   cardKey,
   inlineScriptHash,
   MAX_URL_LENGTH,
+  MAX_REQUEST_BYTES,
   CARD_DESC,
   GENERIC_TITLE,
   CARD_WIDTH,
@@ -40,7 +42,12 @@ function kvStub() {
 
 const BASE = "https://nanolink.example";
 
+const namespaces = new WeakMap();
 function call(env, path, init) {
+  if (!env.CREATORS && env.LINKS) {
+    if (!namespaces.has(env.LINKS)) namespaces.set(env.LINKS, creatorNamespace(env.LINKS));
+    env = { ...env, CREATORS: namespaces.get(env.LINKS) };
+  }
   return worker.fetch(new Request(BASE + path, init), env);
 }
 
@@ -406,4 +413,134 @@ test("og.png for unknown or malformed slugs is 404 and never hits KV on junk", a
     assert.equal((await call({ LINKS }, p)).status, 404, p);
   }
   assert.equal(gets, 0);
+});
+
+
+// --- concurrency, failure and recovery --------------------------------------
+
+test("concurrent first creates keep one card even with stale KV misses", async () => {
+  const LINKS = kvStub();
+  LINKS.get = async () => null; // negative cache at every edge
+  const CREATORS = creatorNamespace(LINKS);
+  const alternate = pngBytes();
+  alternate[40] = 1;
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, i) =>
+    postLink({ LINKS, CREATORS }, { url: GRAPH_URL,
+      card: i ? Buffer.from(alternate).toString("base64") : CARD_B64 })));
+  assert.ok(responses.every(r => r.status === 200));
+  assert.equal(LINKS.puts, 2, "only one image and record published");
+  assert.deepEqual(new Uint8Array(LINKS.store.get(cardKey(await slugFor(GRAPH_URL)))), pngBytes());
+});
+
+test("failed record publication recovers original card after eviction", async () => {
+  const LINKS = kvStub();
+  const put = LINKS.put.bind(LINKS);
+  let fail = true;
+  LINKS.put = async (key, value) => {
+    if (!key.startsWith("img:") && fail) throw new Error("KV unavailable");
+    return put(key, value);
+  };
+  const CREATORS = creatorNamespace(LINKS);
+  const env = { LINKS, CREATORS };
+  const slug = await slugFor(GRAPH_URL);
+  const failed = await postLink(env, { url: GRAPH_URL, card: CARD_B64 });
+  assert.equal(failed.status, 503);
+  assert.equal(failed.headers.get("retry-after"), "5");
+  assert.equal(failed.headers.get("access-control-allow-origin"), "https://nanoodle.com");
+  assert.equal((await call(env, `/${slug}/og.png`)).status, 404, "orphan is hidden");
+  CREATORS.evict(slug);
+  fail = false;
+  const retried = await postLink(env, { url: GRAPH_URL });
+  assert.equal(retried.status, 200);
+  assert.equal(JSON.parse(LINKS.store.get(slug)).img, true, "retry cannot remove original card");
+  assert.deepEqual(new Uint8Array(await (await call(env, `/${slug}/og.png`)).arrayBuffer()), pngBytes());
+});
+
+test("image failure followed by a different card retries the reserved image", async () => {
+  const LINKS = kvStub();
+  const put = LINKS.put.bind(LINKS);
+  let fail = true;
+  LINKS.put = async (key, value) => {
+    if (fail) throw new Error("storage outage");
+    return put(key, value);
+  };
+  const env = { LINKS, CREATORS: creatorNamespace(LINKS) };
+  assert.equal((await postLink(env, { url: GRAPH_URL, card: CARD_B64 })).status, 503);
+  fail = false;
+  const alternate = pngBytes(); alternate[40] = 1;
+  assert.equal((await postLink(env, { url: GRAPH_URL, card: Buffer.from(alternate).toString("base64") })).status, 200);
+  assert.deepEqual(new Uint8Array(LINKS.store.get(cardKey(await slugFor(GRAPH_URL)))), pngBytes());
+});
+
+test("existing conflicting URL returns 409 without modifying stored link", async () => {
+  const LINKS = kvStub();
+  const slug = await slugFor(GRAPH_URL);
+  const other = "https://nanoodle.com/#other";
+  LINKS.store.set(slug, other); // simulate a truncated hash collision
+  const res = await postLink({ LINKS }, { url: GRAPH_URL, card: CARD_B64 });
+  assert.equal(res.status, 409);
+  assert.equal(LINKS.store.get(slug), other);
+  assert.equal(LINKS.puts, 0);
+});
+
+test("published creation survives stale reads after eviction without new writes", async () => {
+  const LINKS = kvStub();
+  const CREATORS = creatorNamespace(LINKS);
+  const env = { LINKS, CREATORS };
+  assert.equal((await postLink(env, { url: GRAPH_URL })).status, 200);
+  CREATORS.evict(await slugFor(GRAPH_URL));
+  LINKS.get = async () => null;
+  assert.equal((await postLink(env, { url: GRAPH_URL, card: CARD_B64 })).status, 200);
+  assert.equal(LINKS.puts, 1);
+});
+
+test("storage faults and invalid persisted targets fail closed, without caching", async () => {
+  const LINKS = kvStub();
+  LINKS.get = async () => { throw new Error("private backend details"); };
+  for (const path of ["/AAAAAAAA", "/AAAAAAAA/og.png", "/api/links/AAAAAAAA"]) {
+    const res = await call({ LINKS }, path);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.ok(!(await res.text()).includes("private backend details"));
+  }
+  for (const value of ["{broken", '{"url":"javascript:alert(1)"}', "https://evil.example/"]) {
+    LINKS.get = async () => value;
+    assert.equal((await call({ LINKS }, "/AAAAAAAA")).status, 503);
+    assert.equal((await call({ LINKS }, "/api/links/AAAAAAAA")).status, 503);
+  }
+});
+
+test("missing coordinator fails closed without a KV write", async () => {
+  const LINKS = kvStub();
+  const res = await worker.fetch(new Request(BASE + "/api/links", {
+    method: "POST", body: JSON.stringify({ url: GRAPH_URL }),
+  }), { LINKS });
+  assert.equal(res.status, 503);
+  assert.equal(LINKS.puts, 0);
+});
+
+test("oversized streamed JSON is cancelled before any persistence", async () => {
+  const LINKS = kvStub();
+  let cancelled = false;
+  const stream = new ReadableStream({
+    pull(controller) { controller.enqueue(new Uint8Array(65536)); },
+    cancel() { cancelled = true; },
+  });
+  const response = await call({ LINKS }, "/api/links", { method: "POST", body: stream, duplex: "half" });
+  assert.equal(response.status, 413);
+  assert.equal(cancelled, true);
+  assert.equal(LINKS.puts, 0);
+  // A legal worst-case escaped URL fits within the transport ceiling.
+  assert.ok(JSON.stringify({ url: "\u0000".repeat(MAX_URL_LENGTH), card: CARD_B64 }).length < MAX_REQUEST_BYTES);
+});
+
+test("HEAD has GET status and headers but no response body on all HTML paths", async () => {
+  const LINKS = kvStub();
+  const { slug } = await (await postLink({ LINKS }, { url: GRAPH_URL, card: CARD_B64 })).json();
+  for (const path of ["/", `/${slug}`, `/${slug}/og.png`, "/AAAAAAAA"]) {
+    const res = await call({ LINKS }, path, { method: "HEAD" });
+    assert.equal(await res.text(), "");
+    assert.equal(res.status, path === "/AAAAAAAA" ? 404 : 200);
+    assert.ok(res.headers.get("content-type"));
+  }
 });

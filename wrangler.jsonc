@@ -9,6 +9,10 @@
 	"observability": {
 		"enabled": false
 	},
+	"durable_objects": {
+		"bindings": [{ "name": "CREATORS", "class_name": "LinkCreator" }]
+	},
+	"migrations": [{ "tag": "v1-creators", "new_sqlite_classes": ["LinkCreator"] }],
 	"kv_namespaces": [
 		// Create the namespace once, then paste its id here:
 		//   npx wrangler kv namespace create LINKS

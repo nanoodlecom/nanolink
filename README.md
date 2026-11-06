@@ -5,7 +5,8 @@ links.** A tiny Cloudflare Worker + KV that turns a 10–60KB share URL into
 `https://<your-worker>/<8-char-slug>` — with no analytics, no logs, and no
 third party ever seeing the workflow.
 
-Zero dependencies. One worker file, one KV namespace.
+Zero runtime dependencies. One Worker, one KV namespace, and a SQLite-backed
+Durable Object namespace for first-creator coordination.
 
 This is self-hostable infrastructure, not a hosted service. The nanoodle
 editor and app player now call this API for their Share → Shorten button
@@ -55,7 +56,9 @@ Rules:
   exactly. Origin comparison, not prefix matching —
   `https://nanoodle.com.evil.tld/...` is rejected.
 - The slug is the first 8 chars of `base64url(SHA-256(url))`. **Deterministic**:
-  the same link always yields the same slug, and is only stored once.
+  the same link always yields the same slug. A per-slug Durable Object reserves
+  the first URL/card atomically and publishes it to KV; retries cannot change
+  the original choice. A conflicting URL at that slug returns `409`.
 - The KV value is a JSON record `{"url", "title", "desc", "img"?}` —
   `title`/`desc` are card metadata best-effort derived from the workflow
   already encoded in the URL fragment (see *Rich link previews*), or `null`
@@ -70,7 +73,10 @@ Rules:
   let anyone who knows a public share URL attach a new image to someone
   else's already-circulating short link. Re-posting an existing URL with a
   card silently ignores the card.
-- Errors return `4xx` with `{"error": "..."}`.
+- Invalid input returns `4xx` with `{"error": "..."}`. Streamed request bodies
+  are bounded before JSON parsing (`413` when oversized). Storage/coordinator
+  failures return uncached, CORS-enabled `503` with `Retry-After: 5`; retrying
+  resumes the original creation, including its original card.
 - CORS: browser calls are allowed from `https://nanoodle.com` only
   (`OPTIONS` preflight handled).
 
@@ -144,7 +150,7 @@ dependencies) — `npx` fetches it on first use. From the repo root:
 npx wrangler login                       # opens the Cloudflare OAuth flow
 npx wrangler kv namespace create LINKS   # prints the namespace id
 # paste the id into wrangler.jsonc ("kv_namespaces" -> "id")
-npx wrangler deploy
+npx wrangler deploy                     # includes v1-creators SQLite migration
 ```
 
 That gives you a live worker at `https://nanolink.<your-subdomain>.workers.dev`.
@@ -170,11 +176,13 @@ npm test
   shortener sees your workflow.
 - **No logs, no analytics, no cookies.** The worker records nothing about who
   created or followed a link. Workers observability is explicitly disabled in
-  `wrangler.jsonc`. The only stored data is the `slug → {url, title, desc}`
-  record — and the title/desc are computed from the URL itself, not from any
-  request context.
-- **No duplicate storage.** Deterministic slugs mean re-shortening the same
-  link is a no-op — there is no per-request record to accumulate.
+  `wrangler.jsonc`. KV holds the link record and optional image. The durable
+  coordinator retains the selected record and temporarily holds the original
+  image until publication succeeds, then clears its image copy. Metadata comes
+  from the URL itself, never request context.
+- **No per-request records.** A deterministic slug has one durable reservation
+  and one public KV record, with an optional image. Re-shortening a published
+  link performs no further KV writes.
 - `Referrer-Policy: no-referrer` on the bounce page, so the short URL isn't
   leaked onward either.
 
@@ -224,8 +232,15 @@ contract.
   off `nanoodle.com` / `www.nanoodle.com`.
 - **KV is eventually consistent** — a freshly created link can take a few
   seconds to resolve from a different edge location.
-- Collisions across the 64⁸ = 2⁴⁸ ≈ 2.8×10¹⁴ slug values are theoretically possible but not
-  handled specially; a colliding URL would resolve to the first-stored link.
+- Collisions across the 64⁸ = 2⁴⁸ ≈ 2.8×10¹⁴ slug values are possible; creation
+  rejects a different existing URL with `409` rather than returning a wrong link.
+- First deployment of the creation coordinator must replace all old writers.
+  KV cannot reveal an already-stale legacy value; drain old in-flight creates
+  and avoid gradual traffic splits with pre-coordinator versions. Never roll
+  back to a version that writes directly to KV.
+
+See [the state-machine audit and release runbook](docs/state-machines.md) for
+state transitions, recovery behavior, verification, and rollout limits.
 
 ## License
 

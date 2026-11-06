@@ -378,3 +378,11 @@ test("bouncePage points og:image at the per-slug card when given one", () => {
   assert.ok(page.includes(`<meta property="og:image" content="${image}">`));
   assert.ok(!page.includes(CARD_IMAGE));
 });
+
+
+test("bounce script round-trips URL control characters without a syntax error", () => {
+  const url = "https://nanoodle.com/#line\nreturn\rtab\tzero\u0000";
+  const escaped = escapeJsString(url);
+  assert.equal(new Function(`return "${escaped}";`)(), url);
+  assert.doesNotMatch(escaped, /[\u0000-\u001f]/);
+});
