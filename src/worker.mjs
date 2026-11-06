@@ -21,8 +21,6 @@ import {
   validateCard,
   cardKey,
   slugFor,
-  deriveCardMeta,
-  packRecord,
   parseRecord,
   bouncePage,
   bounceScript,
@@ -30,7 +28,10 @@ import {
   notFoundPage,
   homePage,
   SLUG_RE,
+  MAX_REQUEST_BYTES,
 } from "./lib.mjs";
+
+export { LinkCreator } from "./creator.mjs";
 
 /** The only origin allowed to call the JSON API from a browser. */
 const ALLOW_ORIGIN = "https://nanoodle.com";
@@ -81,133 +82,177 @@ function html(body, status, cacheControl, scriptSrc) {
   });
 }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
+// Bound streamed bodies before parsing; Content-Length can be absent or false.
+async function readBody(request) {
+  if (!request.body) throw new SyntaxError("missing body");
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_REQUEST_BYTES) {
+        await reader.cancel();
+        throw new RangeError("body too large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return JSON.parse(await new Blob(chunks).text());
+}
 
-    // CORS preflight for the JSON API.
-    if (request.method === "OPTIONS" && path.startsWith("/api/")) {
-      return new Response(null, {
-        status: 204,
+function checkedRecord(raw) {
+  const rec = parseRecord(raw);
+  if (!validateTarget(rec.url).ok) throw new Error("invalid stored record");
+  return rec;
+}
+
+async function handle(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // CORS preflight for the JSON API.
+  if (request.method === "OPTIONS" && path.startsWith("/api/")) {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        ...CORS_HEADERS,
+        "access-control-allow-methods": "GET, POST, OPTIONS",
+        "access-control-allow-headers": "content-type",
+        "access-control-max-age": "86400",
+      },
+    });
+  }
+
+  // POST /api/links — create (or find) a short link.
+  if (path === "/api/links") {
+    if (request.method !== "POST") {
+      return json({ error: "method not allowed" }, 405);
+    }
+    let body;
+    try {
+      body = await readBody(request);
+    } catch (error) {
+      return error instanceof RangeError
+        ? json({ error: "body too large" }, 413)
+        : json({ error: "body must be JSON" }, 400);
+    }
+    const verdict = validateTarget(body?.url);
+    if (!verdict.ok) {
+      return json({ error: verdict.reason }, 400);
+    }
+    // Optional client-rendered card PNG (base64). Validated strictly, and
+    // honored only when the slug is first created (below) — accepting it
+    // later would let anyone who knows a public share URL attach a new
+    // image to someone else's already-circulating short link.
+    let card = null;
+    if (body.card !== undefined && body.card !== null) {
+      const cardVerdict = validateCard(body.card);
+      if (!cardVerdict.ok) {
+        return json({ error: cardVerdict.reason }, 400);
+      }
+      card = cardVerdict.bytes;
+    }
+    const slug = await slugFor(body.url);
+    // Route every creation through the globally unique durable owner. Never
+    // fall back to a KV check/put when the coordinator is unavailable.
+    const owner = env.CREATORS.get(env.CREATORS.idFromName(slug));
+    const result = await owner.fetch("https://creator/", {
+      method: "POST",
+      body: JSON.stringify({ url: body.url, card: card ? body.card : null }),
+    });
+    if (result.status === 409) return json({ error: "slug collision" }, 409);
+    if (!result.ok) throw new Error("creation unavailable");
+    return json({ slug, shortUrl: `${url.origin}/${slug}` });
+  }
+
+  // GET /api/links/<slug> — peek at the stored url.
+  const peek = path.match(/^\/api\/links\/([^/]+)$/);
+  if (peek) {
+    if (request.method !== "GET") {
+      return json({ error: "method not allowed" }, 405);
+    }
+    const raw = SLUG_RE.test(peek[1]) ? await env.LINKS.get(peek[1]) : null;
+    if (raw === null) {
+      return json({ error: "not found" }, 404);
+    }
+    return json({ url: checkedRecord(raw).url });
+  }
+
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return json({ error: "method not allowed" }, 405);
+  }
+
+  if (path === "/") {
+    return html(homePage(), 200, "public, max-age=3600");
+  }
+
+  // GET /<slug>/og.png — the card PNG uploaded when the link was created.
+  // Immutable like the bounce page: a card is only ever written once, at
+  // slug creation.
+  const og = path.match(/^\/([^/]+)\/og\.png$/);
+  if (og && SLUG_RE.test(og[1])) {
+    // An image is public only after its parent record commits. Failed
+    // creations may leave an image replica behind; it must not be served.
+    const raw = await env.LINKS.get(og[1]);
+    const img = raw !== null && checkedRecord(raw).img
+      ? await env.LINKS.get(cardKey(og[1]), "arrayBuffer") : null;
+    if (img !== null) {
+      return new Response(request.method === "HEAD" ? null : img, {
+        status: 200,
         headers: {
-          ...CORS_HEADERS,
-          "access-control-allow-methods": "GET, POST, OPTIONS",
-          "access-control-allow-headers": "content-type",
-          "access-control-max-age": "86400",
+          "content-type": "image/png",
+          "cache-control": "public, max-age=31536000, immutable",
+          "x-content-type-options": "nosniff",
         },
       });
     }
-
-    // POST /api/links — create (or find) a short link.
-    if (path === "/api/links") {
-      if (request.method !== "POST") {
-        return json({ error: "method not allowed" }, 405);
-      }
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ error: "body must be JSON" }, 400);
-      }
-      const verdict = validateTarget(body?.url);
-      if (!verdict.ok) {
-        return json({ error: verdict.reason }, 400);
-      }
-      // Optional client-rendered card PNG (base64). Validated strictly, and
-      // honored only when the slug is first created (below) — accepting it
-      // later would let anyone who knows a public share URL attach a new
-      // image to someone else's already-circulating short link.
-      let card = null;
-      if (body.card !== undefined && body.card !== null) {
-        const cardVerdict = validateCard(body.card);
-        if (!cardVerdict.ok) {
-          return json({ error: cardVerdict.reason }, 400);
-        }
-        card = cardVerdict.bytes;
-      }
-      const slug = await slugFor(body.url);
-      // Deterministic slug: same url -> same slug, so only store once.
-      // (A concurrent duplicate put is harmless — it writes the same value.)
-      const existing = await env.LINKS.get(slug);
-      if (existing === null) {
-        // Best-effort card metadata from the URL fragment. deriveCardMeta
-        // never throws — a malformed fragment stores null metadata and the
-        // bounce page serves the generic card.
-        const meta = await deriveCardMeta(body.url);
-        if (card) {
-          await env.LINKS.put(cardKey(slug), card);
-        }
-        await env.LINKS.put(slug, packRecord(body.url, meta, card !== null));
-      }
-      return json({ slug, shortUrl: `${url.origin}/${slug}` });
-    }
-
-    // GET /api/links/<slug> — peek at the stored url.
-    const peek = path.match(/^\/api\/links\/([^/]+)$/);
-    if (peek) {
-      if (request.method !== "GET") {
-        return json({ error: "method not allowed" }, 405);
-      }
-      const raw = SLUG_RE.test(peek[1]) ? await env.LINKS.get(peek[1]) : null;
-      if (raw === null) {
-        return json({ error: "not found" }, 404);
-      }
-      return json({ url: parseRecord(raw).url });
-    }
-
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      return json({ error: "method not allowed" }, 405);
-    }
-
-    if (path === "/") {
-      return html(homePage(), 200, "public, max-age=3600");
-    }
-
-    // GET /<slug>/og.png — the card PNG uploaded when the link was created.
-    // Immutable like the bounce page: a card is only ever written once, at
-    // slug creation.
-    const og = path.match(/^\/([^/]+)\/og\.png$/);
-    if (og && SLUG_RE.test(og[1])) {
-      const img = await env.LINKS.get(cardKey(og[1]), "arrayBuffer");
-      if (img !== null) {
-        return new Response(request.method === "HEAD" ? null : img, {
-          status: 200,
-          headers: {
-            "content-type": "image/png",
-            "cache-control": "public, max-age=31536000, immutable",
-            "x-content-type-options": "nosniff",
-          },
-        });
-      }
-      return html(notFoundPage(), 404, "no-store");
-    }
-
-    // GET /<slug> — the body bounce. The long URL travels in the response
-    // body, never in a Location header (Cloudflare's h3 edge stalls on
-    // response headers over ~10KB; nanoodle share links can be 10–60KB).
-    const seg = path.slice(1);
-    if (SLUG_RE.test(seg)) {
-      const raw = await env.LINKS.get(seg);
-      if (raw !== null) {
-        // parseRecord handles both the v2 {url, title, desc} record and
-        // legacy v1 values (the bare URL string).
-        const rec = parseRecord(raw);
-        // Slug content is immutable by construction (slug = hash of url),
-        // so the page can be cached forever.
-        return html(
-          bouncePage(rec.url, {
-            shortUrl: `${url.origin}/${seg}`,
-            title: rec.title,
-            desc: rec.desc,
-            image: rec.img ? `${url.origin}/${seg}/og.png` : undefined,
-          }),
-          200,
-          "public, max-age=31536000, immutable",
-          await inlineScriptHash(bounceScript(rec.url)),
-        );
-      }
-    }
     return html(notFoundPage(), 404, "no-store");
+  }
+
+  // GET /<slug> — the body bounce. The long URL travels in the response
+  // body, never in a Location header (Cloudflare's h3 edge stalls on
+  // response headers over ~10KB; nanoodle share links can be 10–60KB).
+  const seg = path.slice(1);
+  if (SLUG_RE.test(seg)) {
+    const raw = await env.LINKS.get(seg);
+    if (raw !== null) {
+      // parseRecord handles both the v2 {url, title, desc} record and
+      // legacy v1 values (the bare URL string).
+      const rec = checkedRecord(raw);
+      // Slug content is immutable by construction (slug = hash of url),
+      // so the page can be cached forever.
+      return html(
+        bouncePage(rec.url, {
+          shortUrl: `${url.origin}/${seg}`,
+          title: rec.title,
+          desc: rec.desc,
+          image: rec.img ? `${url.origin}/${seg}/og.png` : undefined,
+        }),
+        200,
+        "public, max-age=31536000, immutable",
+        await inlineScriptHash(bounceScript(rec.url)),
+      );
+    }
+  }
+  return html(notFoundPage(), 404, "no-store");
+}
+
+export default {
+  async fetch(request, env) {
+    let response;
+    try {
+      response = await handle(request, env);
+    } catch {
+      // Preserve CORS/no-store for transient storage failures. Never leak
+      // stored workflows, platform errors, or credentials into error bodies.
+      response = json({ error: "service temporarily unavailable" }, 503);
+      response.headers.set("retry-after", "5");
+    }
+    return request.method === "HEAD" ? new Response(null, response) : response;
   },
 };

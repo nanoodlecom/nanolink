@@ -76,7 +76,7 @@ export function escapeHtml(s) {
  * sequences, and the U+2028/U+2029 line terminators are all inert.
  */
 export function escapeJsString(s) {
-  return s.replace(/[\\'"<>\u2028\u2029]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  return s.replace(/[\\'"<>\u0000-\u001f\u2028\u2029]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
 }
 
 // --- link-preview card metadata ---------------------------------------------
@@ -105,6 +105,9 @@ export const CARD_HEIGHT = 630;
 
 /** Hard ceiling on an uploaded card PNG (decoded bytes). */
 export const MAX_CARD_BYTES = 200 * 1024;
+
+/** Full JSON transport ceiling, including worst-case escaped URLs. */
+export const MAX_REQUEST_BYTES = MAX_URL_LENGTH * 6 + Math.ceil(MAX_CARD_BYTES / 3) * 4 + 4096;
 
 /** KV key holding the card PNG for a slug. ":" is outside the slug alphabet,
  *  so these keys can never collide with slug records. */
@@ -231,8 +234,8 @@ export function graphChainTitle(graph) {
   const queue = nodes.filter((n) => indeg.get(n.id) === 0).map((n) => n.id);
   const seen = new Set();
   const order = [];
-  while (queue.length) {
-    const id = queue.shift();
+  for (let cursor = 0; cursor < queue.length; cursor++) {
+    const id = queue[cursor];
     if (seen.has(id)) continue;
     seen.add(id);
     order.push(id);
