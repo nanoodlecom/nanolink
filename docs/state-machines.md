@@ -111,6 +111,24 @@ cannot refresh noninteractively. No login flow or deployment was attempted.
    rollback because it lacks the new durable class. Verify platform compatibility
    before any rollback. No rollback has been exercised against production.
 
+## Delivery after the first-writer cutover
+
+The [Worker release workflow](../.github/workflows/worker-release.yml) uses the
+revision that passed the existing test matrix on `main`. It runs the storage
+checks in local workerd, packages the tested bundle, and checks the production
+Worker is already serving one version with the `LinkCreator` binding and the
+same `LINKS` namespace. It then uploads that bundle and records its exact Git
+revision and Cloudflare version. The main-only GitHub environment
+`cloudflare-nanolink` needs `CLOUDFLARE_ACCOUNT_ID` and a dedicated
+`CLOUDFLARE_NANOLINK_API_TOKEN` with access to deploy the existing Worker.
+
+Complete the one-time cutover above with the release operator before
+provisioning the credential. The workflow checks the live binding first, so
+a routine merge cannot initiate the storage migration. After the first
+automated release, check an existing public link and validate the current
+version and bindings. Use the recorded previous version to prepare the
+forward rollback while preserving durable reservations.
+
 ## Remaining limits
 
 - KV remains eventually consistent; a successful create can briefly resolve 404
