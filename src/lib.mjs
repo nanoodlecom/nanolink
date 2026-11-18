@@ -1,3 +1,4 @@
+import { BRAND_FONTS } from "./brand-fonts.mjs";
 // Pure logic for the nanolink worker: validation, slugs, escaping, card
 // metadata, and HTML pages. No I/O, no state — everything here runs
 // unmodified in plain Node (>= 20, where crypto.subtle, atob, and
@@ -348,23 +349,29 @@ export async function inlineScriptHash(source) {
 }
 
 const PAGE_CSS = `
-  :root { color-scheme: light dark; }
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; display: grid; place-items: center;
-    font: 16px/1.5 system-ui, sans-serif;
-    background: #fafafa; color: #1a1a1a;
+    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 1rem;
+    font: 16px/1.6 Manrope, system-ui, sans-serif;
+    background: #0b0d12; color: #eef1f7;
   }
-  main { max-width: 34rem; padding: 2rem; text-align: center; }
+  main {
+    width: min(100%,34rem); padding: clamp(1.2rem,5vw,2rem); text-align: center;
+    border: 1px solid #262c3a; border-radius: 12px; background: #12151d;
+  }
+  h1 { margin: 0 0 .6rem; font: 400 clamp(1.85rem,7vw,2.8rem)/1.1 Righteous,system-ui,sans-serif; }
+  .wordmark { margin: 0 0 1rem; color: #a9b6ff; }
+  p { color: #c3c9d6; }
+  a { color: #a9b6ff; text-underline-offset: .2em; }
   a.go {
-    display: inline-block; margin: 1rem 0; padding: 0.6rem 1.2rem;
-    border-radius: 0.5rem; text-decoration: none; font-weight: 600;
-    background: #1a1a1a; color: #fafafa;
+    display: inline-flex; min-height: 44px; align-items: center; margin: .65rem 0;
+    padding: .6rem 1.2rem; border-radius: 8px; text-decoration: none; font-weight: 750;
+    background: #7c8cff; color: #0b0d12;
   }
-  p.about { font-size: 0.85rem; opacity: 0.7; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #111; color: #eee; }
-    a.go { background: #eee; color: #111; }
-  }
+  a.go:hover { filter: brightness(1.12); }
+  :focus-visible { outline: 2px solid #a9b6ff; outline-offset: 3px; }
+  p.about { font-size: .88rem; }
 `.replace(/\s+/g, " ").trim();
 
 /**
@@ -424,7 +431,7 @@ export function notFoundPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>nanolink — not found</title>
-<style>${PAGE_CSS}</style>
+<style>${BRAND_FONTS}${PAGE_CSS}</style>
 <main>
   <h1>Link not found</h1>
   <p>This short link doesn&#39;t exist (or was mistyped).</p>
@@ -441,11 +448,13 @@ export function homePage() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nanolink</title>
-<style>${PAGE_CSS}</style>
+<style>${BRAND_FONTS}${PAGE_CSS}</style>
 <main>
-  <h1>nanolink</h1>
+  <h1 class="wordmark">nanolink</h1>
   <p>First-party link shortener for <a href="https://nanoodle.com/">nanoodle</a>
   share links. No analytics, no logs, no cookies.</p>
+  <a class="go" href="https://nanoodle.com/">Open nanoodle ↗</a>
+  <p class="about"><a href="https://branding.nanoodle.com/">Brand guidelines</a></p>
 </main>
 </html>
 `;
