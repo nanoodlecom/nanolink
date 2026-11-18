@@ -49,7 +49,7 @@ jobs:
       - name: Build and verify the Worker without credentials
         run: |
           "$RUNNER_TEMP/nanolink-tools/node_modules/.bin/wrangler" deploy --dry-run --strict \
-            --outdir "$RUNNER_TEMP/nanolink" --outfile "$RUNNER_TEMP/nanolink/worker.multipart"
+            --config wrangler.jsonc --outdir "$RUNNER_TEMP/nanolink" --outfile "$RUNNER_TEMP/nanolink/worker.multipart"
           node --check "$RUNNER_TEMP/nanolink/worker.js"
           python3 support/check-worker-release.py "$RUNNER_TEMP/nanolink/worker.multipart"
       - uses: actions/upload-artifact@v4
@@ -127,7 +127,7 @@ jobs:
           printf 'Previous Worker version `%s`\n' "$before" >> "$GITHUB_STEP_SUMMARY"
 
           npx --yes wrangler@4.164.0 deploy "$RUNNER_TEMP/nanolink/worker.js" \
-            --no-bundle --strict --name nanolink --tag "$REVISION" --message "Merge $REVISION"
+            --no-bundle --strict --config wrangler.jsonc --name nanolink --tag "$REVISION" --message "Merge $REVISION"
           version=$(active_version)
           get "$target/versions/$version" | jq -e --arg sha "$REVISION" '.result.annotations["workers/tag"] == $sha'
           get "$target/settings" > "$RUNNER_TEMP/nanolink-settings.json"
