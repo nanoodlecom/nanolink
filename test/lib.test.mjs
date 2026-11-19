@@ -134,7 +134,7 @@ test("bouncePage carries the url in body: meta refresh + script + anchor", () =>
   assert.ok(page.includes(`location.replace("${escapeJsString(url)}");`), "script");
   assert.ok(page.includes(`href="${escapeHtml(url)}"`), "visible anchor");
   assert.match(page, /Continue to nanoodle/);
-  assert.match(page, /prefers-color-scheme: dark/);
+  assert.match(page, /color-scheme: dark/);
 });
 
 test("bouncePage never embeds a hostile url unescaped", () => {

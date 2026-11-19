@@ -64,7 +64,7 @@ function csp(scriptSrc) {
   return (
     "default-src 'none'; " +
     (scriptSrc ? `script-src ${scriptSrc}; ` : "") +
-    "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+    "style-src 'unsafe-inline'; font-src data:; base-uri 'none'; form-action 'none'"
   );
 }
 
